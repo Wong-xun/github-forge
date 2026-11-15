@@ -40,8 +40,9 @@ export interface GitObject {
 }
 
 export function objectId(type: ObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Hash the header and the payload in place: the old code copied the whole
+  // object into a fresh buffer just to hash it.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'ascii').update(data).digest('hex');
 }
 
 export interface Issue {
@@ -388,8 +389,12 @@ export function mergeBase(repo: Repo, a: string, b: string): string | null {
   }
   const seen = new Set<string>();
   const queue = [b];
-  while (queue.length) {
-    const oid = queue.shift() as string;
+  // Index pointer, not shift(): shift() re-indexes the whole queue on every
+  // pop, which turns a long history walk quadratic.
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head] as string;
+    head += 1;
     if (ancestorsA.has(oid)) return oid;
     if (seen.has(oid)) continue;
     seen.add(oid);

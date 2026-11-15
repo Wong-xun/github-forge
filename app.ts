@@ -13,30 +13,40 @@ import { handleMcp } from './mcp.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, requestId?: string): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // One buffer, sized once: the old code stringified, then re-scanned the
+  // string for its byte length, then sent the string (a third pass).
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': String(payload.length),
   };
   if (requestId) headers['x-github-request-id'] = requestId;
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(payload);
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies arrive as one chunk; hand it back instead of copying it
+    // through Buffer.concat.
+    req.on('end', () => {
+      if (chunks.length === 0) resolve(Buffer.alloc(0));
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
 
-function pathOf(req: IncomingMessage): string {
+/** Split req.url into pathname + query in one parse (it used to be parsed twice per request). */
+function splitUrl(req: IncomingMessage): { path: string; search: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const parsed = new URL(req.url ?? '/', 'http://entry');
+    return { path: parsed.pathname, search: parsed.searchParams };
   } catch {
-    return '/';
+    return { path: '/', search: new URLSearchParams() };
   }
 }
 
@@ -51,9 +61,8 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const path = pathOf(req);
+      const { path, search } = splitUrl(req);
       const method = req.method ?? 'GET';
-      const search = new URL(req.url ?? '/', 'http://entry').searchParams;
 
       try {
         // The env's boot check calls this twice: 200 {"ok":true}. No auth.

@@ -36,14 +36,14 @@ export interface RestCtx {
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, ctx: RestCtx, extra: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': ctx.requestId(),
     ...extra,
   });
-  res.end(text);
+  res.end(payload);
 }
 
 function sendNoContent(res: ServerResponse, ctx: RestCtx): void {
@@ -59,7 +59,13 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies arrive as one chunk; hand it back instead of copying it
+    // through Buffer.concat.
+    req.on('end', () => {
+      if (chunks.length === 0) resolve(Buffer.alloc(0));
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }

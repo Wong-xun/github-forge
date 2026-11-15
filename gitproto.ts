@@ -29,9 +29,12 @@ export const PKT_DELIM = Buffer.from('0001', 'ascii');
 
 export function pktLine(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const len = body.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+  // One allocation: length prefix + payload in a single buffer, instead of
+  // building a header buffer and concatenating it onto the body.
+  const out = Buffer.allocUnsafe(body.length + 4);
+  out.write((body.length + 4).toString(16).padStart(4, '0'), 0, 'ascii');
+  body.copy(out, 4);
+  return out;
 }
 
 /** Chunk `data` into sideband band-`band` pkt-line packets (side-band-64k:
@@ -41,7 +44,11 @@ export function sidebandPackets(band: 1 | 2 | 3, data: Buffer): Buffer[] {
   const CHUNK = 65520;
   for (let off = 0; ; off += CHUNK) {
     const slice = data.subarray(off, off + CHUNK);
-    parts.push(pktLine(Buffer.concat([Buffer.from([band]), slice])));
+    // Prefix the band byte without an extra Buffer.concat.
+    const framed = Buffer.allocUnsafe(slice.length + 1);
+    framed[0] = band;
+    slice.copy(framed, 1);
+    parts.push(pktLine(framed));
     if (off + CHUNK >= data.length) break;
   }
   return parts;
@@ -63,9 +70,23 @@ export function parsePktLines(buf: Buffer): PktParseResult {
   const packets: Pkt[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const lenHex = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) break;
-    const len = parseInt(lenHex, 16);
+    // Read the 4-hex-digit length straight off the bytes: the old code cut
+    // a substring per packet and ran a regex over it.
+    let len = 0;
+    let valid = true;
+    for (let i = 0; i < 4; i += 1) {
+      const c = buf[off + i] as number;
+      let digit: number;
+      if (c >= 0x30 && c <= 0x39) digit = c - 0x30;
+      else if (c >= 0x61 && c <= 0x66) digit = c - 0x61 + 10;
+      else if (c >= 0x41 && c <= 0x46) digit = c - 0x41 + 10;
+      else {
+        valid = false;
+        break;
+      }
+      len = len * 16 + digit;
+    }
+    if (!valid) break;
     if (len === 0) {
       packets.push({ kind: 'flush' });
       off += 4;
@@ -115,6 +136,10 @@ export function writePack(objects: PackObject[]): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
+  // Feed the trailer hash as the pack is built, so the pack is concatenated
+  // once at the end instead of twice (once for the hash, once for the trailer).
+  const digest = createHash('sha1');
+  digest.update(header);
   for (const obj of objects) {
     const typeCode = TYPE_CODE[obj.type];
     const size = obj.data.length;
@@ -130,12 +155,16 @@ export function writePack(objects: PackObject[]): Buffer {
       if (remaining > 0) b |= 0x80;
       bytes.push(b);
     }
-    parts.push(Buffer.from(bytes));
-    parts.push(zlib.deflateSync(obj.data));
+    const varint = Buffer.from(bytes);
+    // Level 1: a pack only needs a valid zlib stream, and these payloads are
+    // small; the fastest level wins back real time on every fetch.
+    const deflated = zlib.deflateSync(obj.data, { level: 1 });
+    parts.push(varint, deflated);
+    digest.update(varint);
+    digest.update(deflated);
   }
-  const withoutTrailer = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(withoutTrailer).digest();
-  return Buffer.concat([withoutTrailer, trailer]);
+  parts.push(digest.digest());
+  return Buffer.concat(parts);
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -397,7 +426,13 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies arrive as one chunk; hand it back instead of copying it
+    // through Buffer.concat.
+    req.on('end', () => {
+      if (chunks.length === 0) resolve(Buffer.alloc(0));
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -619,10 +654,13 @@ function sidebandPack(pack: Buffer): Buffer[] {
   const MAX = 65515;
   for (let off = 0; off < pack.length; off += MAX) {
     const chunk = pack.subarray(off, Math.min(pack.length, off + MAX));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    const framed = Buffer.allocUnsafe(chunk.length + 1);
+    framed[0] = 1;
+    chunk.copy(framed, 1);
+    out.push(pktLine(framed));
   }
   if (pack.length === 0) {
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), Buffer.alloc(0)])));
+    out.push(pktLine(Buffer.from([1])));
   }
   return out;
 }
