@@ -513,6 +513,9 @@ function v2Advertisement(): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement never changes: build it once, not per request. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 // ---------------------------------------------------------------------------
 // Git routes
 // ---------------------------------------------------------------------------
@@ -547,7 +550,7 @@ export async function handleGit(
     }
     const wantV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
     if (wantV2) {
-      sendBuffer(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+      sendBuffer(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     } else {
       sendBuffer(
         res,
@@ -665,8 +668,51 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Fetch response cache
+// ---------------------------------------------------------------------------
+//
+// A fetch response is a pure function of (repo, wants, haves, shallow,
+// depth, protocol version): git objects are content-addressed and immutable
+// once stored, and a want's reachable set is fixed by its own bytes, so
+// objects pushed later can never change the answer for the same inputs.
+// The cache is keyed per Repo object — a deleted-and-recreated repo is a
+// new object, so it can never collide with the old one's entries — and
+// bounded, so a large pack cannot grow memory without limit.
+const FETCH_CACHE_MAX_ENTRIES = 32;
+const FETCH_CACHE_MAX_BYTES = 1_000_000;
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function fetchCacheKey(version: 0 | 2, args: FetchArgs): string {
+  return `${version}|${args.depth ?? ''}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}`;
+}
+
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return fetchCache.get(repo)?.get(key);
+}
+
+function fetchCachePut(repo: Repo, key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return;
+  let perRepo = fetchCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map<string, Buffer>();
+    fetchCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= FETCH_CACHE_MAX_ENTRIES) {
+    const oldest = perRepo.keys().next().value;
+    if (oldest !== undefined) perRepo.delete(oldest);
+  }
+  perRepo.set(key, body);
+}
+
 function handleFetchV2(res: ServerResponse, repo: Repo, lines: string[]): boolean {
   const args = parseFetchArgs(lines);
+  const key = fetchCacheKey(2, args);
+  const hit = fetchCacheGet(repo, key);
+  if (hit) {
+    sendBuffer(res, 200, hit, 'application/x-git-upload-pack-result');
+    return true;
+  }
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -682,12 +728,20 @@ function handleFetchV2(res: ServerResponse, repo: Repo, lines: string[]): boolea
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  fetchCachePut(repo, key, body);
+  sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
   return true;
 }
 
 function handleFetchV0(res: ServerResponse, repo: Repo, lines: string[]): boolean {
   const args = parseFetchArgs(lines);
+  const key = fetchCacheKey(0, args);
+  const hit = fetchCacheGet(repo, key);
+  if (hit) {
+    sendBuffer(res, 200, hit, 'application/x-git-upload-pack-result');
+    return true;
+  }
   const plan = planFetch(repo, args.wants, args.haves, args.shallow, args.depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -696,7 +750,9 @@ function handleFetchV0(res: ServerResponse, repo: Repo, lines: string[]): boolea
   for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   parts.push(...sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const body = Buffer.concat(parts);
+  fetchCachePut(repo, key, body);
+  sendBuffer(res, 200, body, 'application/x-git-upload-pack-result');
   return true;
 }
 

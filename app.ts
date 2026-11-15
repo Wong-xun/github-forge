@@ -13,9 +13,14 @@ import { handleMcp } from './mcp.ts';
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, requestId?: string): void {
-  // One buffer, sized once: the old code stringified, then re-scanned the
-  // string for its byte length, then sent the string (a third pass).
-  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  // One buffer, sized once: stringify, then write the bytes plus the
+  // trailing newline into a single allocation instead of building a
+  // concatenated string and copying it into a second buffer.
+  const text = JSON.stringify(body);
+  const byteLen = Buffer.byteLength(text, 'utf8');
+  const payload = Buffer.allocUnsafe(byteLen + 1);
+  payload.write(text, 0, 'utf8');
+  payload[byteLen] = 0x0a;
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
     'content-length': String(payload.length),
@@ -40,13 +45,27 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** Split req.url into pathname + query in one parse (it used to be parsed twice per request). */
+/** Shared empty query: handlers only ever read `.get()` off it, never mutate. */
+const EMPTY_SEARCH = new URLSearchParams();
+
+/**
+ * Split req.url into pathname + query without `new URL()`: the WHATWG parse
+ * costs several microseconds per request and the bench hammers this path
+ * thousands of times. Origin-form URLs are just "/path?query"; anything else
+ * (absolute-form, a fragment) falls back to the full parse, as before.
+ */
 function splitUrl(req: IncomingMessage): { path: string; search: URLSearchParams } {
+  const raw = req.url ?? '/';
+  if (raw.charCodeAt(0) === 0x2f && raw.indexOf('#') < 0) {
+    const qi = raw.indexOf('?');
+    if (qi < 0) return { path: raw, search: EMPTY_SEARCH };
+    return { path: raw.slice(0, qi), search: new URLSearchParams(raw.slice(qi + 1)) };
+  }
   try {
-    const parsed = new URL(req.url ?? '/', 'http://entry');
+    const parsed = new URL(raw, 'http://entry');
     return { path: parsed.pathname, search: parsed.searchParams };
   } catch {
-    return { path: '/', search: new URLSearchParams() };
+    return { path: '/', search: EMPTY_SEARCH };
   }
 }
 

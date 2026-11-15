@@ -36,7 +36,14 @@ export interface RestCtx {
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, ctx: RestCtx, extra: Record<string, string> = {}): void {
-  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  // One buffer, sized once: stringify, then write the bytes plus the
+  // trailing newline into a single allocation instead of building a
+  // concatenated string and copying it into a second buffer.
+  const text = JSON.stringify(body);
+  const byteLen = Buffer.byteLength(text, 'utf8');
+  const payload = Buffer.allocUnsafe(byteLen + 1);
+  payload.write(text, 0, 'utf8');
+  payload[byteLen] = 0x0a;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': payload.length,
@@ -98,6 +105,15 @@ function isHex40(s: string): boolean {
   return /^[0-9a-f]{40}$/i.test(s);
 }
 
+/**
+ * Decode one path segment, skipping decodeURIComponent when the segment has
+ * no '%' at all (the common case: plain ASCII names). A malformed escape
+ * still goes through decodeURIComponent and throws exactly as before.
+ */
+function decodeSeg(s: string): string {
+  return s.indexOf('%') < 0 ? s : decodeURIComponent(s);
+}
+
 /** Resolve a branch name or commit sha to a commit sha. */
 function resolveRef(repo: Repo, ref: string): string | undefined {
   if (isHex40(ref)) {
@@ -132,6 +148,36 @@ export function issueJson(repo: Repo, issue: { number: number; id: number; title
     labels: issue.labels.map((name) => ({ name })),
     user: { login: VIEWER_LOGIN },
   };
+}
+
+/**
+ * The same single-issue JSON as issueJson, built as a string: the write/read
+ * hot paths answer one issue per request, and building the object graph just
+ * to stringify it costs more than interpolating the already-escaped string
+ * fields. Key order and escaping match issueJson exactly (title/body/labels
+ * go through JSON.stringify; state is the 'open'|'closed' enum).
+ */
+export function issueJsonString(issue: { number: number; id: number; title: string; body: string; state: string; labels: string[] }): string {
+  let labelsJson = '';
+  for (let i = 0; i < issue.labels.length; i += 1) {
+    if (i > 0) labelsJson += ',';
+    labelsJson += `{"name":${JSON.stringify(issue.labels[i])}}`;
+  }
+  return `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":"${issue.state}","labels":[${labelsJson}],"user":{"login":"${VIEWER_LOGIN}"}}`;
+}
+
+/** sendJson for an already-serialized JSON string (same framing: + '\\n'). */
+function sendJsonString(res: ServerResponse, status: number, text: string, ctx: RestCtx): void {
+  const byteLen = Buffer.byteLength(text, 'utf8');
+  const payload = Buffer.allocUnsafe(byteLen + 1);
+  payload.write(text, 0, 'utf8');
+  payload[byteLen] = 0x0a;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': payload.length,
+    'x-github-request-id': ctx.requestId(),
+  });
+  res.end(payload);
 }
 
 export function prJson(pr: PullRequest): JsonObj {
@@ -286,8 +332,13 @@ export async function handleRest(
   }
 
   const store = ctx.store;
-  const segments = pathname.split('/').filter((s) => s.length > 0); // ['api','v3',...]
-  const rest = segments.slice(2); // after api/v3
+  // pathname always starts with '/api/v3': split once and drop the leading
+  // '' + 'api' + 'v3' by slicing, instead of running a filter callback over
+  // every segment. A single trailing slash leaves one trailing '' segment;
+  // drop it so '/api/v3/user/repos/' routes like '/api/v3/user/repos'.
+  const parts = pathname.split('/');
+  if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+  const rest = parts.slice(3); // after '', 'api', 'v3'
 
   // GET /user
   if (method === 'GET' && rest.length === 1 && rest[0] === 'user') {
@@ -328,8 +379,8 @@ export async function handleRest(
 
   // /repos/{owner}/{repo}[...]
   if (rest.length >= 3 && rest[0] === 'repos') {
-    const owner = decodeURIComponent(rest[1]);
-    const repoName = decodeURIComponent(rest[2]);
+    const owner = decodeSeg(rest[1]);
+    const repoName = decodeSeg(rest[2]);
     if (owner !== VIEWER_LOGIN) {
       err(res, 404, 'Not Found', ctx);
       return true;
@@ -388,7 +439,7 @@ export async function handleRest(
         return true;
       }
       if (tail.length === 2 && method === 'GET') {
-        const branch = decodeURIComponent(tail[1]);
+        const branch = decodeSeg(tail[1]);
         const sha = repo.refs.get(`refs/heads/${branch}`);
         if (!sha) {
           err(res, 404, 'Not Found', ctx);
@@ -447,7 +498,7 @@ export async function handleRest(
         return true;
       }
       if (tail.length === 4 && tail[2] === 'heads' && method === 'GET') {
-        const branch = decodeURIComponent(tail[3]);
+        const branch = decodeSeg(tail[3]);
         const sha = repo.refs.get(`refs/heads/${branch}`);
         if (!sha) {
           err(res, 404, 'Not Found', ctx);
@@ -462,7 +513,7 @@ export async function handleRest(
 
     // Contents
     if (tail[0] === 'contents') {
-      const path = tail.slice(1).map((s) => decodeURIComponent(s)).join('/');
+      const path = tail.slice(1).map((s) => decodeSeg(s)).join('/');
       if (method === 'GET') {
         const ref = search.get('ref') ?? repo.defaultBranch;
         const tip = resolveRef(repo, ref);
@@ -670,7 +721,7 @@ export async function handleRest(
             }
           }
           const issue = createIssueRecord(repo, title, issueBody, labels);
-          sendJson(res, 201, issueJson(repo, issue), ctx);
+          sendJsonString(res, 201, issueJsonString(issue), ctx);
           return true;
         }
         if (method === 'GET') {
@@ -695,7 +746,7 @@ export async function handleRest(
             err(res, 404, 'Not Found', ctx);
             return true;
           }
-          sendJson(res, 200, issueJson(repo, issue), ctx);
+          sendJsonString(res, 200, issueJsonString(issue), ctx);
           return true;
         }
         if (method === 'PATCH') {
