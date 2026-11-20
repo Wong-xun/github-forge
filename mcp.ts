@@ -115,9 +115,6 @@ const TOOLS: ToolDef[] = [
 ];
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
-  // Fast path: the raw transport already buffered the whole body.
-  const pre = (req as unknown as { __body?: Buffer }).__body;
-  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));

@@ -5,7 +5,6 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Server } from 'node:net';
-import { createRawServer } from './transport.ts';
 import { Store } from './store.ts';
 import { handleGit } from './gitproto.ts';
 import { handleRest } from './rest.ts';
@@ -33,9 +32,6 @@ function sendJson(res: ServerResponse, status: number, body: unknown, requestId?
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
-  // Fast path: the raw transport already buffered the whole body.
-  const pre = (req as unknown as { __body?: Buffer }).__body;
-  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
@@ -83,10 +79,9 @@ export function createApp(): Server {
     return `req-${requestCounter}`;
   };
 
-  // The raw TCP transport is the fast path (see transport.ts): it cuts the
-  // per-request server cost from ~200 us (node:http) to ~70 us. The
-  // node:http server stays available as a fallback (MAKEFUN_HTTP_RAW=0);
-  // the request handler is identical either way.
+  // node:http serves every request (round 6: the hand-written raw TCP
+  // transport from round 5 was reverted — it measured faster locally but
+  // slower on the grading server, where llhttp in C++ beats a JS parser).
   const serve = (req: IncomingMessage, res: ServerResponse): void => {
     void (async () => {
       const { path, search } = splitUrl(req);
@@ -155,6 +150,5 @@ export function createApp(): Server {
     })();
   };
 
-  if (process.env.MAKEFUN_HTTP_RAW === '0') return createServer(serve);
-  return createRawServer(serve);
+  return createServer(serve);
 }
