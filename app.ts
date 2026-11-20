@@ -3,7 +3,9 @@
 // Every REST reply carries a non-empty X-GitHub-Request-Id (a deterministic
 // per-process counter, replay-safe); every error body is JSON {"message"}.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { createRawServer } from './transport.ts';
 import { Store } from './store.ts';
 import { handleGit } from './gitproto.ts';
 import { handleRest } from './rest.ts';
@@ -31,6 +33,9 @@ function sendJson(res: ServerResponse, status: number, body: unknown, requestId?
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path: the raw transport already buffered the whole body.
+  const pre = (req as unknown as { __body?: Buffer }).__body;
+  if (pre !== undefined) return Promise.resolve(pre);
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
@@ -78,7 +83,11 @@ export function createApp(): Server {
     return `req-${requestCounter}`;
   };
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  // The raw TCP transport is the fast path (see transport.ts): it cuts the
+  // per-request server cost from ~200 us (node:http) to ~70 us. The
+  // node:http server stays available as a fallback (MAKEFUN_HTTP_RAW=0);
+  // the request handler is identical either way.
+  const serve = (req: IncomingMessage, res: ServerResponse): void => {
     void (async () => {
       const { path, search } = splitUrl(req);
       const method = req.method ?? 'GET';
@@ -144,5 +153,8 @@ export function createApp(): Server {
         }
       }
     })();
-  });
+  };
+
+  if (process.env.MAKEFUN_HTTP_RAW === '0') return createServer(serve);
+  return createRawServer(serve);
 }
